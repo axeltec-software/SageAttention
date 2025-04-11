@@ -122,8 +122,9 @@ def sageattn(
     - The tensors `q`, `k`, and `v` must have the dtype ``torch.float16`` or ``torch.bfloat16``
     - All tensors must be on the same cuda device.
     """
-        
-    arch = get_cuda_arch_versions()[q.device.index]
+    # ToDo: currently it is commented due to conflict with inductor's compilation pipeline.
+    # arch = get_cuda_arch_versions()[q.device.index]
+    arch = "sm90"
     if arch == "sm80":
         return sageattn_qk_int8_pv_fp16_cuda(q, k, v, tensor_layout=tensor_layout, is_causal=is_causal, sm_scale=sm_scale, return_lse=return_lse, pv_accum_dtype="fp32")
     elif arch == "sm86":
@@ -573,7 +574,7 @@ def sageattn_qk_int8_pv_fp16_cuda(
     else:
         return o
 
-@torch.compiler.disable
+@torch._dynamo.disable(recursive=False)
 def sageattn_qk_int8_pv_fp8_cuda(
     q: torch.Tensor, 
     k: torch.Tensor, 
@@ -742,7 +743,44 @@ def sageattn_qk_int8_pv_fp8_cuda(
     else:
         return o
 
-@torch.compiler.disable
+@torch.library.custom_op("fuse::qk_int8", mutates_args=["q_int8", "k_int8", "v_fp8", "o"])
+def qk_int8(q_int8: torch.Tensor,
+            k_int8: torch.Tensor,
+            v_fp8: torch.Tensor,
+            o: torch.Tensor,
+            q_scale: torch.Tensor,
+            k_scale: torch.Tensor,
+            v_scale: torch.Tensor,
+            _tensor_layout: int,
+            _is_caual: int,
+            _qk_quant_gran:int,
+            sm_scale:float,
+            _return_lse: int) -> torch.Tensor:
+    return _qattn_sm90.qk_int8_sv_f8_accum_f32_fuse_v_scale_attn_inst_buf(q_int8,
+                                                                   k_int8,
+                                                                   v_fp8,
+                                                                   o,
+                                                                   q_scale,
+                                                                   k_scale,
+                                                                   v_scale,
+                                                                   _tensor_layout,
+                                                                   _is_caual,
+                                                                   _qk_quant_gran,
+                                                                   sm_scale,
+                                                                   _return_lse)
+
+@qk_int8.register_fake
+def _(q_int8, k_int8, v_fp8, o, q_scale, k_scale, v_scale, _tensor_layout, _is_caual, _qk_quant_gran, sm_scale, _return_lse):
+    batch_size = q_int8.shape[0]
+    qo_len = q_int8.shape[1]
+    num_qo_heads = q_int8.shape[2]
+    lse = torch.empty((batch_size, num_qo_heads, qo_len), dtype=torch.float32, device=q_int8.device)
+    return lse
+
+@torch.compile(backend="eager")
+def wrap_sqk_int8(q_int8, k_int8, v_fp8, o, q_scale, k_scale, v_scale, _tensor_layout, _is_caual, _qk_quant_gran, sm_scale, _return_lse):
+    return qk_int8(q_int8, k_int8, v_fp8, o, q_scale, k_scale, v_scale, _tensor_layout, _is_caual, _qk_quant_gran, sm_scale, _return_lse)
+
 def sageattn_qk_int8_pv_fp8_cuda_sm90(
     q: torch.Tensor, 
     k: torch.Tensor, 
@@ -833,7 +871,8 @@ def sageattn_qk_int8_pv_fp8_cuda_sm90(
     assert q.device == k.device == v.device, "All tensors must be on the same device."
     assert q.dtype == k.dtype == v.dtype, "All tensors must have the same dtype."
 
-    torch.cuda.set_device(v.device)
+    # ToDo: currently it is commented due to conflict with inductor's compilation pipeline.
+    # torch.cuda.set_device(v.device)
 
     _tensor_layout = 0 if tensor_layout == "NHD" else 1
     _is_caual = 1 if is_causal else 0
@@ -890,12 +929,12 @@ def sageattn_qk_int8_pv_fp8_cuda_sm90(
 
     v_fp8, v_scale, _ = per_channel_fp8(v, tensor_layout=tensor_layout, smooth_v=False)
 
-    if pv_accum_dtype == "fp32":
-        raise NotImplementedError("Please use pv_accum_dtype='fp32+fp32' for sm90.")
-        lse = _qattn_sm90.qk_int8_sv_f8_accum_f32_fuse_v_scale_attn(q_int8, k_int8, v_fp8, o, q_scale, k_scale, v_scale, _tensor_layout, _is_caual, _qk_quant_gran, sm_scale, _return_lse)
-    elif pv_accum_dtype == "fp32+fp32":
-        lse = _qattn_sm90.qk_int8_sv_f8_accum_f32_fuse_v_scale_attn_inst_buf(q_int8, k_int8, v_fp8, o, q_scale, k_scale, v_scale, _tensor_layout, _is_caual, _qk_quant_gran, sm_scale, _return_lse)
-
+    # if pv_accum_dtype == "fp32":
+    #     raise NotImplementedError("Please use pv_accum_dtype='fp32+fp32' for sm90.")
+    #     lse = _qattn_sm90.qk_int8_sv_f8_accum_f32_fuse_v_scale_attn(q_int8, k_int8, v_fp8, o, q_scale, k_scale, v_scale, _tensor_layout, _is_caual, _qk_quant_gran, sm_scale, _return_lse)
+    # elif pv_accum_dtype == "fp32+fp32":
+    # lse = _qattn_sm90.qk_int8_sv_f8_accum_f32_fuse_v_scale_attn_inst_buf(q_int8, k_int8, v_fp8, o, q_scale, k_scale, v_scale, _tensor_layout, _is_caual, _qk_quant_gran, sm_scale, _return_lse)
+    lse = wrap_sqk_int8(q_int8, k_int8, v_fp8, o, q_scale, k_scale, v_scale, _tensor_layout, _is_caual, _qk_quant_gran, sm_scale, _return_lse)
     o = o[..., :head_dim_og]
 
     if return_lse:
